@@ -1,0 +1,866 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>会议签到</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/qrcode/build/qrcode.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+<style>
+  body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;-webkit-tap-highlight-color:transparent}
+  .toast{position:fixed;top:24px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,.82);color:#fff;padding:10px 18px;border-radius:10px;z-index:9999;font-size:14px;animation:fadein .2s;max-width:90%;text-align:center}
+  @keyframes fadein{from{opacity:0;transform:translate(-50%,-8px)}to{opacity:1;transform:translateX(-50%)}}
+  .btn-pri{background:#111827;color:#fff;border-radius:12px;padding:12px 16px;font-weight:600;width:100%;transition:.15s;display:flex;align-items:center;justify-content:center;gap:6px}
+  .btn-pri:active{transform:scale(.98)}
+  .btn-pri:disabled{background:#9ca3af}
+  .btn-sec{background:#f3f4f6;color:#111827;border-radius:12px;padding:11px 16px;font-weight:500;width:100%;transition:.15s}
+  .btn-sec:active{background:#e5e7eb}
+  .input{width:100%;border:1px solid #e5e7eb;border-radius:12px;padding:12px 14px;font-size:15px;outline:none;transition:.15s;background:#fff}
+  .input:focus{border-color:#111827}
+  .card{background:#fff;border-radius:16px;padding:18px;box-shadow:0 1px 2px rgba(0,0,0,.04),0 1px 8px rgba(0,0,0,.04)}
+  .skeleton{background:linear-gradient(90deg,#f3f4f6 25%,#e5e7eb 50%,#f3f4f6 75%);background-size:200% 100%;animation:sk 1.4s infinite;border-radius:8px}
+  @keyframes sk{0%{background-position:200% 0}100%{background-position:-200% 0}}
+  .signpad-wrap{position:relative;border:2px dashed #d1d5db;border-radius:12px;background:#fff;overflow:hidden}
+  .signpad{display:block;width:100%;height:180px;touch-action:none;cursor:crosshair}
+  .signpad-hint{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#d1d5db;font-size:14px;pointer-events:none;letter-spacing:1px}
+  .sig-img{background:#fff;border:1px solid #e5e7eb;border-radius:6px;padding:2px}
+  #pdfSheet{position:fixed;left:-99999px;top:0;width:794px;background:#fff;font-family:"PingFang SC","Microsoft YaHei",sans-serif}
+  .hist-row{position:relative;overflow:hidden;border-bottom:1px solid #f3f4f6;background:#fff;transition:max-height .2s,opacity .2s,padding .2s,margin .2s}
+  .hist-row:last-child{border-bottom:0}
+  .hist-del{position:absolute;right:0;top:0;bottom:0;width:72px;background:#ef4444;color:#fff;border:0;font-size:14px;font-weight:500;display:flex;align-items:center;justify-content:center;cursor:pointer}
+  .hist-inner{position:relative;display:flex;align-items:center;justify-content:space-between;padding:10px 4px;background:#fff;touch-action:pan-y;user-select:none;-webkit-user-select:none;will-change:transform;cursor:pointer}
+</style>
+</head>
+<body class="bg-gray-50 min-h-screen">
+
+<div id="app" class="max-w-md mx-auto p-4 pb-20"></div>
+<div id="pdfSheet"></div>
+
+<script>
+/* ===================== 基础工具 ===================== */
+const API = 'https://api.jsonblob.com/api/jsonBlob';
+const $ = (s, r=document) => r.querySelector(s);
+const app = $('#app');
+const params = new URLSearchParams(location.search);
+const action = params.get('a') || 'create';
+const id = params.get('id') || '';
+
+function toast(msg, ms=1800){
+  const t = document.createElement('div');
+  t.className = 'toast';
+  t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(()=>t.remove(), ms);
+}
+
+function fmtTime(s){
+  const d = new Date(s);
+  const pad = n => (n<10?'0':'')+n;
+  return `${d.getMonth()+1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function escapeHTML(s){
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+/* ===================== IndexedDB 缓存原 PDF ===================== */
+const IDB = {
+  _db: null,
+  open(){
+    if(this._db) return Promise.resolve(this._db);
+    return new Promise((res, rej)=>{
+      const req = indexedDB.open('signin-pdf', 1);
+      req.onupgradeneeded = e => { e.target.result.createObjectStore('pdf'); };
+      req.onsuccess = e => { this._db = e.target.result; res(this._db); };
+      req.onerror = e => rej(e);
+    });
+  },
+  async put(key, val){
+    const db = await this.open();
+    return new Promise((res, rej)=>{
+      const tx = db.transaction('pdf','readwrite');
+      tx.objectStore('pdf').put(val, key);
+      tx.oncomplete = ()=>res();
+      tx.onerror = e => rej(e);
+    });
+  },
+  async get(key){
+    const db = await this.open();
+    return new Promise((res, rej)=>{
+      const tx = db.transaction('pdf','readonly');
+      const r = tx.objectStore('pdf').get(key);
+      r.onsuccess = ()=>res(r.result);
+      r.onerror = e => rej(e);
+    });
+  }
+};
+
+/* ===================== 历史会议记录（localStorage） ===================== */
+const HIST_KEY = 'signin-history';
+function getHistory(){
+  try{ return JSON.parse(localStorage.getItem(HIST_KEY) || '[]'); }catch(e){ return []; }
+}
+function saveHistoryItem(item){
+  if(!item || !item.id) return;
+  const list = getHistory();
+  const idx = list.findIndex(x => x.id === item.id);
+  const merged = idx >= 0 ? { ...list[idx], ...item } : item;
+  if(idx >= 0) list.splice(idx, 1);
+  list.unshift(merged);
+  if(list.length > 20) list.length = 20;
+  try{ localStorage.setItem(HIST_KEY, JSON.stringify(list)); }catch(e){}
+}
+function clearHistory(){
+  try{ localStorage.removeItem(HIST_KEY); }catch(e){}
+}
+function removeHistoryItem(id){
+  const list = getHistory().filter(x => x.id !== id);
+  try{ localStorage.setItem(HIST_KEY, JSON.stringify(list)); }catch(e){}
+}
+
+/* ===================== jsonblob API ===================== */
+async function createBlob(data){
+  const r = await fetch(API, {
+    method: 'POST',
+    headers: {'Content-Type':'application/json','Accept':'application/json'},
+    body: JSON.stringify(data)
+  });
+  if(!r.ok) throw new Error('创建失败 '+r.status);
+  let blobId = r.headers.get('X-jsonblob-id') || r.headers.get('x-jsonblob-id');
+  if(!blobId){
+    const loc = r.headers.get('Location') || r.headers.get('location') || '';
+    const m = loc.match(/\/([A-Za-z0-9-]+)\/?$/);
+    blobId = m ? m[1] : '';
+  }
+  if(!blobId) throw new Error('未拿到 blobId');
+  return blobId;
+}
+
+async function getBlob(blobId){
+  const r = await fetch(`${API}/${blobId}`, {headers:{'Accept':'application/json'}});
+  if(!r.ok) throw new Error('读取失败 '+r.status);
+  const etag = r.headers.get('ETag') || r.headers.get('etag') || '';
+  const data = await r.json();
+  return { data, etag };
+}
+
+async function putBlob(blobId, data, etag){
+  const headers = {'Content-Type':'application/json','Accept':'application/json'};
+  if(etag) headers['If-Match'] = etag;
+  const r = await fetch(`${API}/${blobId}`, {method:'PUT', headers, body: JSON.stringify(data)});
+  return r;
+}
+
+async function safeUpdate(blobId, mutator, retries=4){
+  for(let i=0; i<retries; i++){
+    const {data, etag} = await getBlob(blobId);
+    const result = mutator(JSON.parse(JSON.stringify(data)));
+    if(result === false) return data;
+    const r = await putBlob(blobId, result, etag);
+    if(r.ok) return result;
+    if(r.status !== 412) throw new Error('保存失败 '+r.status);
+    await new Promise(res => setTimeout(res, 250 + Math.random()*300));
+  }
+  throw new Error('保存冲突，请重试');
+}
+
+/* ===================== 手写签名板 ===================== */
+function setupSignPad(canvas, hintEl){
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  function resize(){
+    const rect = canvas.getBoundingClientRect();
+    if(rect.width === 0) return false;
+    canvas.width = Math.round(rect.width * dpr);
+    canvas.height = Math.round(rect.height * dpr);
+    const ctx = canvas.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.lineWidth = 2.5;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = '#111827';
+    return true;
+  }
+  if(!resize()){
+    requestAnimationFrame(resize);
+  }
+  const ctx = canvas.getContext('2d');
+
+  let drawing = false, empty = true;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+
+  const get = e => {
+    const r = canvas.getBoundingClientRect();
+    const t = (e.touches && e.touches[0]) || (e.changedTouches && e.changedTouches[0]) || e;
+    return { x: t.clientX - r.left, y: t.clientY - r.top };
+  };
+  const track = p => {
+    if(p.x < minX) minX = p.x;
+    if(p.y < minY) minY = p.y;
+    if(p.x > maxX) maxX = p.x;
+    if(p.y > maxY) maxY = p.y;
+  };
+  const start = e => {
+    e.preventDefault();
+    drawing = true;
+    const p = get(e);
+    ctx.beginPath();
+    ctx.moveTo(p.x, p.y);
+    ctx.lineTo(p.x + 0.1, p.y + 0.1);
+    ctx.stroke();
+    track(p);
+    empty = false;
+    if(hintEl) hintEl.style.display = 'none';
+  };
+  const move = e => {
+    if(!drawing) return;
+    e.preventDefault();
+    const p = get(e);
+    ctx.lineTo(p.x, p.y);
+    ctx.stroke();
+    track(p);
+  };
+  const end = e => {
+    if(!drawing) return;
+    drawing = false;
+  };
+  canvas.addEventListener('mousedown', start);
+  canvas.addEventListener('mousemove', move);
+  window.addEventListener('mouseup', end);
+  canvas.addEventListener('touchstart', start, {passive:false});
+  canvas.addEventListener('touchmove', move, {passive:false});
+  canvas.addEventListener('touchend', end);
+  canvas.addEventListener('touchcancel', end);
+
+  return {
+    clear(){
+      const r = canvas.getBoundingClientRect();
+      ctx.clearRect(0, 0, r.width, r.height);
+      empty = true;
+      minX = Infinity; minY = Infinity; maxX = -Infinity; maxY = -Infinity;
+      if(hintEl) hintEl.style.display = '';
+    },
+    isEmpty(){ return empty; },
+    toDataURL(maxW = 480){
+      if(empty) return '';
+      const r = canvas.getBoundingClientRect();
+      const pad = 10;
+      const x = Math.max(0, minX - pad);
+      const y = Math.max(0, minY - pad);
+      const w = Math.min(r.width - x, (maxX - minX) + pad*2);
+      const h = Math.min(r.height - y, (maxY - minY) + pad*2);
+      if(w <= 0 || h <= 0) return '';
+      const outW = Math.min(maxW, Math.round(w * dpr));
+      const outH = Math.round(outW * (h / w));
+      const out = document.createElement('canvas');
+      out.width = outW; out.height = outH;
+      const octx = out.getContext('2d');
+      octx.fillStyle = '#ffffff';
+      octx.fillRect(0, 0, outW, outH);
+      octx.drawImage(canvas, x*dpr, y*dpr, w*dpr, h*dpr, 0, 0, outW, outH);
+      return out.toDataURL('image/png');
+    }
+  };
+}
+
+/* ===================== 路由分发 ===================== */
+window.addEventListener('DOMContentLoaded', ()=>{
+  if(action === 'sign' && id) return renderSign(id);
+  if(action === 'admin' && id) return renderAdmin(id);
+  renderCreate();
+});
+
+/* ===================== 创建页 ===================== */
+function renderCreate(){
+  app.innerHTML = `
+    <div class="mt-3 mb-5">
+      <h1 class="text-2xl font-bold text-gray-900">会议签到</h1>
+      <p class="text-sm text-gray-500 mt-1">上传 PDF → 生成二维码 → 同事扫码手写签名</p>
+    </div>
+
+    <div class="card space-y-4">
+      <div>
+        <div class="text-sm font-medium text-gray-700">① 选择会议纪要 PDF</div>
+        <label for="pdfFile" id="dropZone" class="mt-2 border-2 border-dashed border-gray-300 rounded-xl p-5 text-center cursor-pointer hover:border-gray-400 transition block relative">
+          <input type="file" id="pdfFile" accept="application/pdf,.pdf,application/x-pdf"
+                 style="position:absolute;left:0;top:0;width:100%;height:100%;opacity:0;cursor:pointer;z-index:1">
+          <div id="dzIdle" class="relative" style="z-index:0;pointer-events:none">
+            <div class="text-gray-400 text-3xl">📄</div>
+            <div class="text-sm text-gray-600 mt-2">点击选择 PDF 文件</div>
+            <div class="text-xs text-gray-400 mt-1">手机如果点不开，请在系统浏览器中打开</div>
+          </div>
+          <div id="dzFile" class="hidden relative" style="z-index:0;pointer-events:none">
+            <div class="text-2xl">✅</div>
+            <div class="text-sm text-gray-800 mt-2 font-medium truncate" id="dzFileName"></div>
+            <div class="text-xs text-gray-400 mt-1" id="dzFileSize"></div>
+          </div>
+        </label>
+      </div>
+
+      <label class="block">
+        <span class="text-sm font-medium text-gray-700">② 你的名字（发起人）</span>
+        <input type="text" id="hostName" class="input mt-2" placeholder="例如：马帅" maxlength="20">
+      </label>
+
+      <label class="block">
+        <span class="text-sm font-medium text-gray-700">③ 会议标题（可选）</span>
+        <input type="text" id="title" class="input mt-2" placeholder="不填则用 PDF 文件名" maxlength="40">
+      </label>
+
+      <div>
+        <div class="flex items-center justify-between">
+          <span class="text-sm font-medium text-gray-700">④ 你的签名（可选）</span>
+          <button id="clearHostSig" type="button" class="text-xs text-gray-400 underline">清空</button>
+        </div>
+        <div class="signpad-wrap mt-2">
+          <canvas id="hostSigPad" class="signpad"></canvas>
+          <div class="signpad-hint" id="hostSigHint">在此手写你的签名（不写则不算入签到）</div>
+        </div>
+      </div>
+
+      <button id="goBtn" class="btn-pri">生成签到二维码</button>
+      <p class="text-xs text-gray-400 text-center">所有数据仅保存 1 天 · 仅用于轻量场景</p>
+    </div>
+
+    <div id="historyCard" class="card mt-3 hidden">
+      <div class="flex items-center justify-between mb-2">
+        <div class="text-sm font-medium text-gray-700">最近创建的会议</div>
+        <button id="clearHist" class="text-xs text-gray-400 underline">清空</button>
+      </div>
+      <div id="historyList"></div>
+      <p class="text-xs text-gray-400 mt-2">数据保留 1 天，过期会议无法打开</p>
+    </div>
+  `;
+
+  const fileInput = $('#pdfFile');
+  const dz = $('#dropZone');
+  let selectedFile = null;
+
+  function setFile(f){
+    if(!f) return;
+    if(f.type !== 'application/pdf' && !f.name.toLowerCase().endsWith('.pdf')){
+      toast('请选择 PDF 文件'); return;
+    }
+    if(f.size > 20 * 1024 * 1024){
+      toast('PDF 不能超过 20MB'); return;
+    }
+    selectedFile = f;
+    $('#dzIdle').classList.add('hidden');
+    $('#dzFile').classList.remove('hidden');
+    $('#dzFileName').textContent = f.name;
+    $('#dzFileSize').textContent = (f.size/1024/1024).toFixed(2) + ' MB · 点击可更换';
+  }
+
+  dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('border-gray-500'); });
+  dz.addEventListener('dragleave', ()=> dz.classList.remove('border-gray-500'));
+  dz.addEventListener('drop', e => {
+    e.preventDefault(); dz.classList.remove('border-gray-500');
+    if(e.dataTransfer.files[0]) setFile(e.dataTransfer.files[0]);
+  });
+  fileInput.addEventListener('change', e => {
+    if(e.target.files && e.target.files[0]) setFile(e.target.files[0]);
+  });
+
+  const hostPad = setupSignPad($('#hostSigPad'), $('#hostSigHint'));
+  $('#clearHostSig').addEventListener('click', ()=> hostPad.clear());
+
+  $('#goBtn').addEventListener('click', async ()=>{
+    const host = $('#hostName').value.trim();
+    if(!selectedFile) return toast('请先选择 PDF');
+    if(!host) return toast('请填写你的名字');
+    const title = $('#title').value.trim() || selectedFile.name.replace(/\.pdf$/i,'');
+
+    const btn = $('#goBtn');
+    btn.disabled = true; btn.textContent = '上传中…';
+    try{
+      const buf = await selectedFile.arrayBuffer();
+      const now = new Date().toISOString();
+      const signatures = [];
+      if(!hostPad.isEmpty()){
+        const sig = hostPad.toDataURL();
+        if(sig) signatures.push({ name: host, sig, at: now, isHost: true });
+      }
+      const data = {
+        title, host,
+        pdfName: selectedFile.name,
+        createdAt: now,
+        signatures
+      };
+      btn.textContent = '创建会议…';
+      const blobId = await createBlob(data);
+      btn.textContent = '保存 PDF…';
+      await IDB.put(blobId, buf);
+      saveHistoryItem({ id: blobId, title, host, createdAt: now, signCount: signatures.length });
+      location.href = `?a=admin&id=${blobId}`;
+    }catch(e){
+      console.error(e);
+      toast(e.message || '创建失败', 3500);
+      btn.disabled = false; btn.textContent = '生成签到二维码';
+    }
+  });
+
+  renderHistory();
+}
+
+function renderHistory(){
+  const list = getHistory();
+  const card = $('#historyCard');
+  const listEl = $('#historyList');
+  if(!card || !listEl) return;
+  if(list.length === 0){ card.classList.add('hidden'); return; }
+  card.classList.remove('hidden');
+  listEl.innerHTML = list.map(h => `
+    <div class="hist-row" data-id="${escapeHTML(h.id)}">
+      <button type="button" class="hist-del">删除</button>
+      <div class="hist-inner">
+        <div class="min-w-0 flex-1 mr-3">
+          <div class="text-sm font-medium text-gray-800 truncate">${escapeHTML(h.title || '未命名会议')}</div>
+          <div class="text-xs text-gray-400 mt-0.5">${escapeHTML(h.host || '')} · ${fmtTime(h.createdAt)}${h.signCount?` · ${h.signCount} 人签到`:''}</div>
+        </div>
+        <div class="text-gray-300 text-lg shrink-0">›</div>
+      </div>
+    </div>
+  `).join('');
+
+  const DEL_W = 72;
+  const rows = listEl.querySelectorAll('.hist-row');
+  rows.forEach(row => {
+    const inner = row.querySelector('.hist-inner');
+    const del = row.querySelector('.hist-del');
+    const id = row.dataset.id;
+    let startX = 0, baseX = 0, dragging = false, opened = false, moved = false;
+
+    const setX = (x, animate=false) => {
+      inner.style.transition = animate ? 'transform .2s' : 'none';
+      inner.style.transform = `translateX(${x}px)`;
+    };
+    const open = () => { setX(-DEL_W, true); opened = true; };
+    const close = () => { setX(0, true); opened = false; };
+
+    const closeOthers = () => {
+      rows.forEach(r => {
+        if(r !== row){
+          const i = r.querySelector('.hist-inner');
+          i.style.transition = 'transform .2s';
+          i.style.transform = 'translateX(0)';
+        }
+      });
+    };
+
+    const onStart = e => {
+      const t = e.touches ? e.touches[0] : e;
+      startX = t.clientX;
+      baseX = opened ? -DEL_W : 0;
+      dragging = true;
+      moved = false;
+      inner.style.transition = 'none';
+      closeOthers();
+    };
+    const onMove = e => {
+      if(!dragging) return;
+      const t = e.touches ? e.touches[0] : e;
+      let dx = baseX + (t.clientX - startX);
+      if(dx > 0) dx = 0;
+      if(dx < -DEL_W * 1.4) dx = -DEL_W * 1.4;
+      if(Math.abs(t.clientX - startX) > 4) moved = true;
+      setX(dx);
+      if(e.cancelable && moved) e.preventDefault();
+    };
+    const onEnd = e => {
+      if(!dragging) return;
+      dragging = false;
+      const t = (e.changedTouches && e.changedTouches[0]) || e;
+      const dx = baseX + (t.clientX - startX);
+      if(dx < -DEL_W/2) open(); else close();
+    };
+
+    inner.addEventListener('touchstart', onStart, {passive:true});
+    inner.addEventListener('touchmove', onMove, {passive:false});
+    inner.addEventListener('touchend', onEnd);
+    inner.addEventListener('touchcancel', onEnd);
+
+    inner.addEventListener('mousedown', e => {
+      onStart(e);
+      const mm = ev => onMove(ev);
+      const mu = ev => {
+        onEnd(ev);
+        window.removeEventListener('mousemove', mm);
+        window.removeEventListener('mouseup', mu);
+      };
+      window.addEventListener('mousemove', mm);
+      window.addEventListener('mouseup', mu);
+    });
+
+    inner.addEventListener('click', e => {
+      if(moved){ e.preventDefault(); return; }
+      if(opened){ e.preventDefault(); close(); return; }
+      location.href = `?a=admin&id=${encodeURIComponent(id)}`;
+    });
+
+    del.addEventListener('click', e => {
+      e.stopPropagation();
+      removeHistoryItem(id);
+      row.style.maxHeight = row.offsetHeight + 'px';
+      requestAnimationFrame(()=>{
+        row.style.maxHeight = '0';
+        row.style.opacity = '0';
+        row.style.paddingTop = '0';
+        row.style.paddingBottom = '0';
+        row.style.marginTop = '0';
+        row.style.marginBottom = '0';
+      });
+      setTimeout(()=>renderHistory(), 220);
+    });
+  });
+
+  $('#clearHist').onclick = (e) => {
+    e.preventDefault();
+    if(!confirm('清空所有历史记录？')) return;
+    clearHistory();
+    renderHistory();
+  };
+}
+
+/* ===================== 管理页 ===================== */
+async function renderAdmin(blobId){
+  app.innerHTML = `<div class="mt-6 space-y-3"><div class="skeleton h-8 w-1/2"></div><div class="skeleton h-48 w-full"></div><div class="skeleton h-32 w-full"></div></div>`;
+  let state;
+  try{
+    state = await getBlob(blobId);
+  }catch(e){
+    return app.innerHTML = `<div class="card mt-6 text-center"><div class="text-4xl">😢</div><p class="text-gray-700 mt-3">会议数据已过期或不存在</p><a href="./" class="btn-pri mt-4 inline-flex">返回首页</a></div>`;
+  }
+  const data = state.data;
+  const signUrl = `${location.origin}${location.pathname}?a=sign&id=${blobId}`;
+
+  // 进入管理页就把这条记录补到历史里（兼容直接打开 admin URL 的场景）
+  saveHistoryItem({
+    id: blobId,
+    title: data.title,
+    host: data.host,
+    createdAt: data.createdAt,
+    signCount: data.signatures.length
+  });
+
+  app.innerHTML = `
+    <div class="mt-3 mb-4 flex items-center justify-between">
+      <div class="min-w-0 mr-3">
+        <h1 id="metaTitle" class="text-xl font-bold text-gray-900 truncate">${escapeHTML(data.title)}</h1>
+        <p class="text-xs text-gray-500 mt-1"><span id="metaHost">${escapeHTML(data.host||'未填写')}</span> · ${fmtTime(data.createdAt)}</p>
+      </div>
+      <div class="shrink-0 flex items-center gap-3">
+        <button id="editMetaBtn" class="text-xs text-gray-500 underline">编辑</button>
+        <a href="./" class="text-xs text-gray-500 underline">返回</a>
+      </div>
+    </div>
+
+    <div id="metaEditCard" class="card mb-3 hidden">
+      <label class="block text-xs text-gray-500 mb-1">会议标题</label>
+      <input id="editTitle" class="input mb-2" value="${escapeHTML(data.title)}" placeholder="会议标题">
+      <label class="block text-xs text-gray-500 mb-1">发起人</label>
+      <input id="editHost" class="input mb-3" value="${escapeHTML(data.host||'')}" placeholder="发起人姓名">
+      <div class="flex gap-2">
+        <button id="saveMetaBtn" class="btn-pri">保存</button>
+        <button id="cancelMetaBtn" class="btn-sec">取消</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="text-sm font-medium text-gray-700 mb-3">扫码签到</div>
+      <div class="flex justify-center bg-white rounded-xl p-3">
+        <canvas id="qrCanvas"></canvas>
+      </div>
+      <div class="mt-3 flex gap-2">
+        <input type="text" readonly value="${signUrl}" class="input text-xs" id="signUrl">
+        <button id="copyBtn" class="btn-sec px-4" style="width:auto">复制</button>
+      </div>
+    </div>
+
+    <div class="card mt-3">
+      <div class="flex items-center justify-between mb-3">
+        <div class="text-sm font-medium text-gray-700">已签到 <span id="signCount" class="text-gray-400">(${data.signatures.length})</span></div>
+        <button id="refreshBtn" class="text-xs text-gray-500">刷新</button>
+      </div>
+      <div id="signList" class="space-y-2"></div>
+    </div>
+
+    <div class="card mt-3 space-y-2">
+      <button id="dlBtn" class="btn-pri">📥 下载带签到页的 PDF</button>
+      <p class="text-xs text-gray-400 text-center">下载后再次签到，可重新下载最新版</p>
+    </div>
+  `;
+
+  QRCode.toCanvas($('#qrCanvas'), signUrl, {width: 220, margin: 1, color:{dark:'#111827',light:'#ffffff'}});
+
+  $('#copyBtn').addEventListener('click', async ()=>{
+    try{
+      await navigator.clipboard.writeText(signUrl);
+      toast('链接已复制');
+    }catch(e){
+      $('#signUrl').select(); document.execCommand('copy'); toast('链接已复制');
+    }
+  });
+
+  // 编辑会议元信息（标题 / 发起人）
+  $('#editMetaBtn').addEventListener('click', ()=>{
+    $('#metaEditCard').classList.toggle('hidden');
+  });
+  $('#cancelMetaBtn').addEventListener('click', ()=>{
+    $('#metaEditCard').classList.add('hidden');
+  });
+  $('#saveMetaBtn').addEventListener('click', async ()=>{
+    const newTitle = $('#editTitle').value.trim();
+    const newHost = $('#editHost').value.trim();
+    if(!newTitle){ toast('请填写会议标题'); return; }
+    const saveBtn = $('#saveMetaBtn');
+    saveBtn.disabled = true; saveBtn.textContent = '保存中…';
+    try{
+      await safeUpdate(blobId, d => { d.title = newTitle; d.host = newHost; return d; });
+      state.data.title = newTitle; state.data.host = newHost;
+      $('#metaTitle').textContent = newTitle;
+      $('#metaHost').textContent = newHost || '未填写';
+      saveHistoryItem({ id: blobId, title: newTitle, host: newHost, createdAt: state.data.createdAt, signCount: state.data.signatures.length });
+      $('#metaEditCard').classList.add('hidden');
+      toast('已保存');
+    }catch(e){
+      console.error(e); toast(e.message || '保存失败', 3500);
+    }
+    saveBtn.disabled = false; saveBtn.textContent = '保存';
+  });
+
+  function renderList(sigs){
+    $('#signCount').textContent = `(${sigs.length})`;
+    $('#signList').innerHTML = sigs.map((s,i)=>`
+      <div class="flex items-center gap-3 py-2 border-b border-gray-100 last:border-0">
+        <div class="w-7 h-7 rounded-full ${s.isHost?'bg-gray-900 text-white':'bg-gray-100 text-gray-600'} flex items-center justify-center text-xs font-medium shrink-0">${i+1}</div>
+        <div class="flex-1 min-w-0">
+          ${s.sig
+            ? `<img src="${s.sig}" class="sig-img" style="max-height:48px;max-width:100%;object-fit:contain;display:block">`
+            : `<div class="text-sm text-gray-800">${escapeHTML(s.name||'')}</div>`}
+        </div>
+        <div class="text-right shrink-0">
+          ${s.isHost?'<div class="text-xs text-gray-500">发起人</div>':''}
+          <div class="text-xs text-gray-400">${fmtTime(s.at)}</div>
+        </div>
+      </div>
+    `).join('');
+  }
+  renderList(data.signatures);
+
+  async function refresh(){
+    try{
+      const {data: d} = await getBlob(blobId);
+      state.data = d;
+      renderList(d.signatures);
+      saveHistoryItem({ id: blobId, title: d.title, host: d.host, createdAt: d.createdAt, signCount: d.signatures.length });
+    }catch(e){}
+  }
+  $('#refreshBtn').addEventListener('click', ()=>{ refresh(); toast('已刷新'); });
+  setInterval(refresh, 8000);
+
+  $('#dlBtn').addEventListener('click', async ()=>{
+    const btn = $('#dlBtn');
+    btn.disabled = true; btn.textContent = '生成中…';
+    try{
+      await refresh();
+      let pdfBuf = await IDB.get(blobId);
+      // 本地 IDB 没有原 PDF（换设备打开或我替你预制的会议）→ 从 jsonblob 中的 pdfUrl 拉一次缓存进 IDB
+      if(!pdfBuf && state.data.pdfUrl){
+        btn.textContent = '拉取 PDF…';
+        try{
+          const resp = await fetch(state.data.pdfUrl);
+          if(!resp.ok) throw new Error('PDF 拉取失败 ' + resp.status);
+          pdfBuf = await resp.arrayBuffer();
+          await IDB.put(blobId, pdfBuf);
+        }catch(e){
+          console.error(e);
+          toast('远端 PDF 拉取失败：' + (e.message||'未知错误'), 4000);
+          btn.disabled = false; btn.textContent = '📥 下载带签到页的 PDF';
+          return;
+        }
+      }
+      if(!pdfBuf){
+        toast('原 PDF 不在此设备，请回创建页重新上传', 3500);
+        btn.disabled = false; btn.textContent = '📥 下载带签到页的 PDF';
+        return;
+      }
+      btn.textContent = '合成中…';
+      const out = await composePDF(pdfBuf, state.data, signUrl);
+      downloadBlob(out, `${state.data.title}（含签到）.pdf`);
+      toast('已下载');
+    }catch(e){
+      console.error(e); toast(e.message || '生成失败', 3500);
+    }
+    btn.disabled = false; btn.textContent = '📥 下载带签到页的 PDF';
+  });
+}
+
+/* ===================== 签名页（扫码者） ===================== */
+async function renderSign(blobId){
+  app.innerHTML = `<div class="mt-6 space-y-3"><div class="skeleton h-8 w-1/2"></div><div class="skeleton h-48 w-full"></div></div>`;
+  let resp;
+  try{
+    resp = await getBlob(blobId);
+  }catch(e){
+    return app.innerHTML = `<div class="card mt-6 text-center"><div class="text-4xl">😢</div><p class="text-gray-700 mt-3">会议数据已过期或不存在</p></div>`;
+  }
+  let data = resp.data;
+
+  function renderListMini(sigs){
+    return sigs.map((s,i)=>`
+      <div class="flex items-center gap-3 py-2 border-b border-gray-100 last:border-0">
+        <div class="w-6 h-6 rounded-full ${s.isHost?'bg-gray-900 text-white':'bg-gray-100 text-gray-600'} flex items-center justify-center text-xs shrink-0">${i+1}</div>
+        <div class="flex-1 min-w-0">
+          ${s.sig
+            ? `<img src="${s.sig}" class="sig-img" style="max-height:40px;max-width:100%;object-fit:contain;display:block">`
+            : `<div class="text-sm text-gray-700">${escapeHTML(s.name||'')}</div>`}
+        </div>
+        <div class="text-right shrink-0">
+          ${s.isHost?'<div class="text-[10px] text-gray-500">发起人</div>':''}
+          <div class="text-xs text-gray-400">${fmtTime(s.at)}</div>
+        </div>
+      </div>
+    `).join('');
+  }
+
+  function paint(){
+    app.innerHTML = `
+      <div class="mt-3 mb-4">
+        <h1 class="text-xl font-bold text-gray-900 truncate">${escapeHTML(data.title)}</h1>
+        <p class="text-xs text-gray-500 mt-1">${escapeHTML(data.host)} 发起 · ${fmtTime(data.createdAt)}</p>
+      </div>
+
+      <div class="card">
+        <div class="text-sm font-medium text-gray-700 mb-2">在下方手写你的签名</div>
+        <div class="signpad-wrap">
+          <canvas id="sigPad" class="signpad"></canvas>
+          <div class="signpad-hint" id="sigHint">在此手写签名</div>
+        </div>
+        <div class="flex gap-2 mt-3">
+          <button id="clearBtn" type="button" class="btn-sec" style="flex:1">清除</button>
+          <button id="submitBtn" class="btn-pri" style="flex:2">✍️ 提交签到</button>
+        </div>
+      </div>
+
+      <div class="card mt-3">
+        <div class="text-sm font-medium text-gray-700 mb-2">已签到 <span class="text-gray-400">(${data.signatures.length})</span></div>
+        <div>${renderListMini(data.signatures)}</div>
+      </div>
+    `;
+
+    const pad = setupSignPad($('#sigPad'), $('#sigHint'));
+    $('#clearBtn').addEventListener('click', ()=> pad.clear());
+    $('#submitBtn').addEventListener('click', async ()=>{
+      if(pad.isEmpty()) return toast('请先手写签名');
+      const sig = pad.toDataURL(480);
+      const btn = $('#submitBtn');
+      btn.disabled = true; btn.textContent = '提交中…';
+      try{
+        const result = await safeUpdate(blobId, d => {
+          d.signatures.push({ sig, at: new Date().toISOString() });
+          return d;
+        });
+        data = result;
+        const myAt = new Date().toISOString();
+        app.innerHTML = `
+          <div class="mt-10 text-center">
+            <div class="text-6xl mb-3">✅</div>
+            <h2 class="text-xl font-bold text-gray-900">签到成功</h2>
+            <p class="text-gray-500 mt-2 text-sm">已保存到「我的签名」</p>
+          </div>
+          <div class="card mt-5">
+            <div class="text-xs text-gray-500 mb-2">你的签名</div>
+            <div style="background:#fafafa;border-radius:10px;padding:10px;display:flex;align-items:center;justify-content:center;min-height:80px">
+              <img src="${sig}" style="max-width:100%;max-height:120px">
+            </div>
+            <div class="text-xs text-gray-400 mt-2 text-right">${fmtTime(myAt)}</div>
+          </div>
+          <div class="card mt-3">
+            <div class="text-sm font-medium text-gray-700 mb-2">全部签名 <span class="text-gray-400">(${data.signatures.length})</span></div>
+            <div>${renderListMini(data.signatures)}</div>
+          </div>
+          <p class="text-xs text-gray-400 text-center mt-4">可以关闭页面了 · 名单已同步给发起人</p>
+        `;
+      }catch(e){
+        toast(e.message || '签到失败', 3500);
+        btn.disabled = false; btn.textContent = '✍️ 提交签到';
+      }
+    });
+  }
+  paint();
+}
+
+/* ===================== 签到页 HTML 模板（用于 PDF 嵌入） ===================== */
+async function renderSheet(data, signUrl){
+  const qrUrl = await QRCode.toDataURL(signUrl, {width: 260, margin: 1, color:{dark:'#111827',light:'#ffffff'}});
+  const sigs = data.signatures;
+  const cells = sigs.map(s => `
+    <div style="display:flex;align-items:center;justify-content:center;min-height:46px;padding:4px">
+      ${s.sig
+        ? `<img src="${s.sig}" style="max-width:100%;max-height:42px;object-fit:contain;display:block">`
+        : `<div style="font-size:14px;font-weight:600;color:#111827">${escapeHTML(s.name||'')}</div>`}
+    </div>
+  `).join('');
+
+  $('#pdfSheet').innerHTML = `
+    <div style="padding:56px 52px;width:794px;box-sizing:border-box;min-height:1123px;background:#fff;color:#111827">
+      <div style="text-align:center;border-bottom:2px solid #111827;padding-bottom:18px;margin-bottom:24px">
+        <div style="font-size:30px;font-weight:700;letter-spacing:1px">会议签到表</div>
+        <div style="font-size:14px;color:#6b7280;margin-top:8px">${escapeHTML(data.title)}</div>
+      </div>
+
+      <div style="font-size:18px;font-weight:700;color:#111827;margin-bottom:14px;padding-bottom:8px;border-bottom:1px solid #e5e7eb">参会人员</div>
+      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:7px">
+        ${cells}
+      </div>
+    </div>
+  `;
+}
+
+/* ===================== PDF 合成 ===================== */
+async function composePDF(originalBuf, data, signUrl){
+  await renderSheet(data, signUrl);
+  const imgs = $('#pdfSheet').querySelectorAll('img');
+  await Promise.all([...imgs].map(img => img.complete ? null : new Promise(res => { img.onload = img.onerror = res; })));
+  await new Promise(r => setTimeout(r, 80));
+  const sheetEl = $('#pdfSheet').firstElementChild;
+  const canvas = await html2canvas(sheetEl, {
+    scale: 2,
+    backgroundColor: '#ffffff',
+    width: 794,
+    windowWidth: 794
+  });
+  const pngDataUrl = canvas.toDataURL('image/png');
+  const pngBytes = await (await fetch(pngDataUrl)).arrayBuffer();
+
+  const { PDFDocument } = PDFLib;
+  const pdf = await PDFDocument.load(originalBuf);
+  const pngImg = await pdf.embedPng(pngBytes);
+
+  const pageW = 595, pageH = 842;
+  const page = pdf.addPage([pageW, pageH]);
+  const ratio = canvas.height / canvas.width;
+  const drawW = pageW;
+  const drawH = pageW * ratio;
+  const y = drawH > pageH ? 0 : (pageH - drawH);
+  page.drawImage(pngImg, {
+    x: 0,
+    y: y < 0 ? 0 : y,
+    width: drawW,
+    height: drawH > pageH ? pageH : drawH
+  });
+  const out = await pdf.save();
+  return new Blob([out], {type:'application/pdf'});
+}
+
+function downloadBlob(blob, filename){
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url), 5000);
+}
+</script>
+</body>
+</html>
