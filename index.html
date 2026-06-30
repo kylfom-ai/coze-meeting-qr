@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
+<meta name="referrer" content="no-referrer">
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>会议签到</title>
@@ -669,7 +670,7 @@ async function renderAdmin(blobId){
       if(!pdfBuf && state.data.pdfUrl){
         btn.textContent = '拉取 PDF…';
         try{
-          const resp = await fetch(state.data.pdfUrl);
+          const resp = await fetch(state.data.pdfUrl, { referrerPolicy: 'no-referrer' });
           if(!resp.ok) throw new Error('PDF 拉取失败 ' + resp.status);
           pdfBuf = await resp.arrayBuffer();
           await IDB.put(blobId, pdfBuf);
