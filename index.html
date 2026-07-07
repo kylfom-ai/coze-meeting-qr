@@ -1,7 +1,6 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-<meta name="referrer" content="no-referrer">
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>会议签到</title>
@@ -658,7 +657,22 @@ async function renderAdmin(blobId){
     }catch(e){}
   }
   $('#refreshBtn').addEventListener('click', ()=>{ refresh(); toast('已刷新'); });
-  setInterval(refresh, 8000);
+  // v3 加速①：轮询 8s → 3s（jsonblob 免费额度足够）
+  setInterval(refresh, 3000);
+  // v3 加速②：同源签到端提交成功后主动通知，同设备/同浏览器秒级刷新
+  try{
+    const bc = new BroadcastChannel(`meeting-${blobId}`);
+    bc.onmessage = (ev)=>{ if(ev && ev.data && ev.data.type==='signed') refresh(); };
+  }catch(e){}
+  window.addEventListener('storage', (ev)=>{
+    if(ev.key === `meeting-signed:${blobId}`) refresh();
+  });
+  // v3 加速③：tab 从后台切回前台时立即刷新（避开浏览器 setInterval 节流到 1min+ 的坑）
+  document.addEventListener('visibilitychange', ()=>{
+    if(document.visibilityState === 'visible') refresh();
+  });
+  window.addEventListener('focus', refresh);
+  window.addEventListener('pageshow', refresh);
 
   $('#dlBtn').addEventListener('click', async ()=>{
     const btn = $('#dlBtn');
@@ -670,7 +684,7 @@ async function renderAdmin(blobId){
       if(!pdfBuf && state.data.pdfUrl){
         btn.textContent = '拉取 PDF…';
         try{
-          const resp = await fetch(state.data.pdfUrl, { referrerPolicy: 'no-referrer' });
+          const resp = await fetch(state.data.pdfUrl);
           if(!resp.ok) throw new Error('PDF 拉取失败 ' + resp.status);
           pdfBuf = await resp.arrayBuffer();
           await IDB.put(blobId, pdfBuf);
@@ -763,6 +777,13 @@ async function renderSign(blobId){
           return d;
         });
         data = result;
+        // v3 加速②：签到成功后立即通知管理端（同设备/同浏览器）
+        try{
+          localStorage.setItem(`meeting-signed:${blobId}`, String(Date.now()));
+          const bc = new BroadcastChannel(`meeting-${blobId}`);
+          bc.postMessage({type:'signed', at: Date.now()});
+          bc.close();
+        }catch(e){}
         const myAt = new Date().toISOString();
         app.innerHTML = `
           <div class="mt-10 text-center">
