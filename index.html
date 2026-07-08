@@ -139,11 +139,13 @@ async function createBlob(data){
 }
 
 async function getBlob(blobId){
-  // v5 破缓存：jsonblob 走 Cloudflare CDN 且返回 Cache-Control: max-age=300，
-  // 不破缓存会导致管理墙 fetch 命中浏览器/CDN 缓存，看到 5 分钟前的旧签名。
-  // 双重保险：URL 加时间戳穿透 CDN + cache:'no-store' 绕过浏览器缓存。
+  // v5.1 破缓存（无 CORS 副作用）：jsonblob 走 Cloudflare CDN 且返回
+  // Cache-Control: max-age=300，会导致管理墙 fetch 命中浏览器/CDN 缓存看到 5 分钟前数据。
+  // 注意：不能加 'Cache-Control' 请求头——jsonblob CORS preflight 未放行该 header，
+  // 加上会触发 CORS 拒绝，误报"会议数据已过期或不存在"（v5 踩坑）。
+  // 双保险：URL 时间戳穿透 CDN + fetch cache:'no-store' 绕过浏览器缓存。
   const r = await fetch(`${API}/${blobId}?_=${Date.now()}`, {
-    headers:{'Accept':'application/json','Cache-Control':'no-cache'},
+    headers:{'Accept':'application/json'},
     cache:'no-store'
   });
   if(!r.ok) throw new Error('读取失败 '+r.status);
